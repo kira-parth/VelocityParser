@@ -1,0 +1,452 @@
+`timescale 1ns / 1ps
+
+module nasdaq_itch_parser_production (
+    input  wire         clk,
+    input  wire         rst_n,
+    input  wire         enable,
+    
+    input  wire         eth_in_tvalid,
+    input  wire         eth_in_tlast,
+    input  wire [3:0]   eth_in_tkeep,
+    input  wire [31:0]  eth_in_tdata,
+    output wire         eth_in_tready,
+    
+    output reg          cmd_out_tvalid,
+    output reg [296:0]  cmd_out_tdata,
+    input  wire         cmd_out_tready,
+    
+    input  wire [31:0]  fpga_time,
+    
+    input  wire [2:0]   cfg_wr_addr,
+    input  wire         cfg_wr_en,
+    input  wire [31:0]  cfg_wr_data,
+    input  wire [2:0]   cfg_rd_addr,
+    output reg  [31:0]  cfg_rd_data,
+    
+    output reg [31:0]   stat_packets_received,
+    output reg [31:0]   stat_packets_dropped,
+    output reg [31:0]   stat_packets_passed,
+    output reg [31:0]   stat_itch_filtered
+);
+
+localparam DEFAULT_NASDAQ_IP   = 32'hE9360C65;
+localparam DEFAULT_UDP_PORT    = 16'h6720;
+localparam ETHERTYPE_IPV4      = 16'h0800;
+localparam IP_PROTO_UDP        = 8'h11;
+
+localparam STATE_IDLE          = 4'd0;
+localparam STATE_RECEIVING     = 4'd1;
+localparam STATE_PROCESSING    = 4'd2;
+localparam STATE_OUTPUT        = 4'd3;
+localparam STATE_DROP          = 4'd4;
+
+localparam MSG_TYPE_S = 8'h53;
+localparam MSG_TYPE_R = 8'h52;
+localparam MSG_TYPE_H = 8'h48;
+localparam MSG_TYPE_Y = 8'h59;
+localparam MSG_TYPE_L = 8'h4C;
+localparam MSG_TYPE_V = 8'h56;
+localparam MSG_TYPE_W = 8'h57;
+localparam MSG_TYPE_K = 8'h4B;
+localparam MSG_TYPE_J = 8'h4A;
+localparam MSG_TYPE_A = 8'h41;
+localparam MSG_TYPE_F = 8'h46;
+localparam MSG_TYPE_E = 8'h45;
+localparam MSG_TYPE_C = 8'h43;
+localparam MSG_TYPE_X = 8'h58;
+localparam MSG_TYPE_D = 8'h44;
+localparam MSG_TYPE_U = 8'h55;
+localparam MSG_TYPE_P = 8'h50;
+localparam MSG_TYPE_Q = 8'h51;
+localparam MSG_TYPE_B = 8'h42;
+localparam MSG_TYPE_I = 8'h49;
+localparam MSG_TYPE_N = 8'h4E;
+
+reg [31:0] nasdaq_ip_addr;
+reg [15:0] nasdaq_udp_port;
+reg [31:0] msg_type_filter;
+reg        filter_enable;
+
+reg [3:0]  state;
+reg [7:0]  word_count;
+reg [31:0] packet_buffer [0:31];
+
+assign eth_in_tready = (state == STATE_IDLE || state == STATE_RECEIVING || state == STATE_DROP) && enable && rst_n;
+
+always @(*) begin
+    case (cfg_rd_addr)
+        3'd0:    cfg_rd_data = nasdaq_ip_addr;
+        3'd1:    cfg_rd_data = {16'd0, nasdaq_udp_port};
+        3'd2:    cfg_rd_data = msg_type_filter;
+        3'd3:    cfg_rd_data = {31'd0, filter_enable};
+        3'd4:    cfg_rd_data = stat_packets_received;
+        3'd5:    cfg_rd_data = stat_packets_dropped;
+        3'd6:    cfg_rd_data = stat_packets_passed;
+        3'd7:    cfg_rd_data = stat_itch_filtered;
+        default: cfg_rd_data = 32'd0;
+    endcase
+end
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        nasdaq_ip_addr  <= DEFAULT_NASDAQ_IP;
+        nasdaq_udp_port <= DEFAULT_UDP_PORT;
+        msg_type_filter <= 32'h0000_07FF;
+        filter_enable   <= 1'b1;
+    end else if (cfg_wr_en) begin
+        case (cfg_wr_addr)
+            3'd0: nasdaq_ip_addr  <= cfg_wr_data;
+            3'd1: nasdaq_udp_port <= cfg_wr_data[15:0];
+            3'd2: msg_type_filter <= cfg_wr_data;
+            3'd3: filter_enable   <= cfg_wr_data[0];
+        endcase
+    end
+end
+
+integer i;
+reg [15:0] ethertype_extracted;
+reg [7:0]  ip_proto_extracted;
+reg [31:0] ip_dst_extracted;
+reg [15:0] udp_port_extracted;
+reg [15:0] itch_len_extracted;
+reg [7:0]  itch_type_extracted;
+reg        msg_type_allowed;
+
+function [4:0] get_msg_filter_bit;
+    input [7:0] msg_type;
+    begin
+        case (msg_type)
+            MSG_TYPE_S: get_msg_filter_bit = 5'd0;
+            MSG_TYPE_R: get_msg_filter_bit = 5'd1;
+            MSG_TYPE_H: get_msg_filter_bit = 5'd2;
+            MSG_TYPE_Y: get_msg_filter_bit = 5'd3;
+            MSG_TYPE_A: get_msg_filter_bit = 5'd4;
+            MSG_TYPE_F: get_msg_filter_bit = 5'd5;
+            MSG_TYPE_E: get_msg_filter_bit = 5'd6;
+            MSG_TYPE_C: get_msg_filter_bit = 5'd7;
+            MSG_TYPE_X: get_msg_filter_bit = 5'd8;
+            MSG_TYPE_D: get_msg_filter_bit = 5'd9;
+            MSG_TYPE_U: get_msg_filter_bit = 5'd10;
+            MSG_TYPE_P: get_msg_filter_bit = 5'd11;
+            MSG_TYPE_Q: get_msg_filter_bit = 5'd12;
+            MSG_TYPE_B: get_msg_filter_bit = 5'd13;
+            MSG_TYPE_I: get_msg_filter_bit = 5'd14;
+            MSG_TYPE_N: get_msg_filter_bit = 5'd15;
+            default:    get_msg_filter_bit = 5'd31;
+        endcase
+    end
+endfunction
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        state <= STATE_IDLE;
+        word_count <= 8'd0;
+        cmd_out_tvalid <= 1'b0;
+        cmd_out_tdata <= 297'd0;
+        
+        stat_packets_received <= 32'd0;
+        stat_packets_dropped <= 32'd0;
+        stat_packets_passed <= 32'd0;
+        stat_itch_filtered <= 32'd0;
+        
+        for (i = 0; i < 32; i = i + 1) begin
+            packet_buffer[i] <= 32'd0;
+        end
+        
+    end else if (enable) begin
+        
+        case (state)
+            STATE_IDLE: begin
+                word_count <= 8'd0;
+                cmd_out_tvalid <= 1'b0;
+                
+                if (eth_in_tvalid && eth_in_tready) begin
+                    state <= STATE_RECEIVING;
+                    packet_buffer[0] <= eth_in_tdata;
+                    word_count <= 8'd1;
+                end
+            end
+            
+            STATE_RECEIVING: begin
+                if (eth_in_tvalid && eth_in_tready) begin
+                    if (word_count < 32) begin
+                        packet_buffer[word_count] <= eth_in_tdata;
+                    end
+                    
+                    word_count <= word_count + 8'd1;
+                    
+                    if (eth_in_tlast) begin
+                        state <= STATE_PROCESSING;
+                        stat_packets_received <= stat_packets_received + 32'd1;
+                    end
+                end
+            end
+            
+            STATE_PROCESSING: begin
+                ethertype_extracted = {packet_buffer[3][23:16], packet_buffer[3][15:8]};
+                
+                if (ethertype_extracted != ETHERTYPE_IPV4) begin
+                    state <= STATE_DROP;
+                    stat_packets_dropped <= stat_packets_dropped + 32'd1;
+                end else begin
+                    ip_proto_extracted = packet_buffer[5][31:24];
+                    ip_dst_extracted = {packet_buffer[7][15:8], packet_buffer[7][7:0],
+                                       packet_buffer[8][31:24], packet_buffer[8][23:16]};
+                    
+                    if (ip_proto_extracted != IP_PROTO_UDP) begin
+                        state <= STATE_DROP;
+                        stat_packets_dropped <= stat_packets_dropped + 32'd1;
+                    end else if (ip_dst_extracted != nasdaq_ip_addr) begin
+                        state <= STATE_DROP;
+                        stat_packets_dropped <= stat_packets_dropped + 32'd1;
+                    end else begin
+                        udp_port_extracted = {packet_buffer[9][31:24], packet_buffer[9][23:16]};
+                        
+                        if (udp_port_extracted != nasdaq_udp_port) begin
+                            state <= STATE_DROP;
+                            stat_packets_dropped <= stat_packets_dropped + 32'd1;
+                        end else begin
+                            itch_len_extracted = {packet_buffer[10][15:8], packet_buffer[10][7:0]};
+                            itch_type_extracted = packet_buffer[11][31:24];
+                            
+                            if (filter_enable) begin
+                                if (get_msg_filter_bit(itch_type_extracted) < 31) begin
+                                    msg_type_allowed = msg_type_filter[get_msg_filter_bit(itch_type_extracted)];
+                                end else begin
+                                    msg_type_allowed = 1'b0;
+                                end
+                                
+                                if (msg_type_allowed) begin
+                                    state <= STATE_OUTPUT;
+                                    stat_packets_passed <= stat_packets_passed + 32'd1;
+                                end else begin
+                                    state <= STATE_DROP;
+                                    stat_itch_filtered <= stat_itch_filtered + 32'd1;
+                                end
+                            end else begin
+                                state <= STATE_OUTPUT;
+                                stat_packets_passed <= stat_packets_passed + 32'd1;
+                            end
+                        end
+                    end
+                end
+            end
+            
+            STATE_OUTPUT: begin
+                if (!cmd_out_tvalid) begin
+                    cmd_out_tvalid <= 1'b1;
+                    
+                    cmd_out_tdata[296:265] <= fpga_time;
+                    cmd_out_tdata[264:257] <= itch_type_extracted;
+                    cmd_out_tdata[256:225] <= packet_buffer[11];
+                    cmd_out_tdata[224:193] <= packet_buffer[12];
+                    cmd_out_tdata[192:161] <= packet_buffer[13];
+                    cmd_out_tdata[160:129] <= packet_buffer[14];
+                    cmd_out_tdata[128:97]  <= packet_buffer[15];
+                    cmd_out_tdata[96:65]   <= packet_buffer[16];
+                    cmd_out_tdata[64:33]   <= packet_buffer[17];
+                    cmd_out_tdata[32:1]    <= packet_buffer[18];
+                    cmd_out_tdata[0]       <= 1'b0;
+                end
+                
+                if (cmd_out_tvalid && cmd_out_tready) begin
+                    cmd_out_tvalid <= 1'b0;
+                    state <= STATE_IDLE;
+                end
+            end
+            
+            STATE_DROP: begin
+                state <= STATE_IDLE;
+            end
+            
+            default: begin
+                state <= STATE_IDLE;
+            end
+        endcase
+    end
+end
+
+endmodule
+
+`timescale 1ns / 1ps
+
+module nasdaq_itch_parser_production_tb();
+
+    reg         clk = 0;
+    reg         rst_n = 0;
+    reg         enable = 1;
+    
+    reg         eth_in_tvalid = 0;
+    reg         eth_in_tlast = 0;
+    reg [3:0]   eth_in_tkeep = 0;
+    reg [31:0]  eth_in_tdata = 0;
+    wire        eth_in_tready;
+    
+    wire        cmd_out_tvalid;
+    wire [296:0] cmd_out_tdata;
+    reg         cmd_out_tready = 1;
+    
+    reg [31:0]  fpga_time = 0;
+    
+    reg [2:0]   cfg_wr_addr = 0;
+    reg         cfg_wr_en = 0;
+    reg [31:0]  cfg_wr_data = 0;
+    reg [2:0]   cfg_rd_addr = 0;
+    wire [31:0] cfg_rd_data;
+    
+    wire [31:0] stat_packets_received;
+    wire [31:0] stat_packets_dropped;
+    wire [31:0] stat_packets_passed;
+    wire [31:0] stat_itch_filtered;
+    
+    always #1.55 clk = ~clk;
+    
+    always @(posedge clk) begin
+        if (!rst_n)
+            fpga_time <= 32'd0;
+        else
+            fpga_time <= fpga_time + 32'd1;
+    end
+    
+    nasdaq_itch_parser_production dut (.*);
+    
+    task send_packet;
+        input [7:0] msg_type;
+        input [31:0] payload1;
+        input [31:0] payload2;
+        begin
+            $display("\n[%0t] Sending packet with ITCH type: %c (0x%h)", $time/1000.0, msg_type, msg_type);
+            
+            @(posedge clk);
+            eth_in_tvalid = 1'b1;
+            eth_in_tkeep = 4'hF;
+            
+            eth_in_tdata = 32'hFFFFFFFF; @(posedge clk);
+            eth_in_tdata = 32'hFFFF0011; @(posedge clk);
+            eth_in_tdata = 32'h22334455; @(posedge clk);
+            eth_in_tdata = 32'h66080045; @(posedge clk);
+            eth_in_tdata = 32'h00280000; @(posedge clk);
+            eth_in_tdata = 32'h11004000; @(posedge clk);
+            eth_in_tdata = 32'h0000C0A8; @(posedge clk);
+            eth_in_tdata = 32'h0001E936; @(posedge clk);
+            eth_in_tdata = 32'h0C656720; @(posedge clk);
+            eth_in_tdata = 32'h67200014; @(posedge clk);
+            eth_in_tdata = 32'h0000000C; @(posedge clk);
+            eth_in_tdata = {msg_type, 24'h000100}; @(posedge clk);
+            eth_in_tdata = payload1; @(posedge clk);
+            eth_in_tdata = payload2; @(posedge clk);
+            eth_in_tdata = 32'hBC4F0000; eth_in_tlast = 1'b1; @(posedge clk);
+            
+            eth_in_tvalid = 1'b0;
+            eth_in_tlast = 1'b0;
+            
+            repeat(10) @(posedge clk);
+        end
+    endtask
+    
+    task configure_filter;
+        input [31:0] filter_mask;
+        input enable_filtering;
+        begin
+            $display("\n[%0t] Configuring filter: mask=0x%h, enable=%b", $time/1000.0, filter_mask, enable_filtering);
+            @(posedge clk);
+            cfg_wr_en = 1'b1;
+            cfg_wr_addr = 3'd2;
+            cfg_wr_data = filter_mask;
+            @(posedge clk);
+            cfg_wr_addr = 3'd3;
+            cfg_wr_data = {31'd0, enable_filtering};
+            @(posedge clk);
+            cfg_wr_en = 1'b0;
+            repeat(5) @(posedge clk);
+        end
+    endtask
+    
+    task display_statistics;
+        begin
+            $display("\n========================================");
+            $display("STATISTICS:");
+            $display("========================================");
+            $display("  Packets Received  : %0d", stat_packets_received);
+            $display("  Packets Passed    : %0d", stat_packets_passed);
+            $display("  Packets Dropped   : %0d", stat_packets_dropped);
+            $display("  ITCH Filtered     : %0d", stat_itch_filtered);
+            $display("========================================\n");
+        end
+    endtask
+    
+    always @(posedge clk) begin
+        if (cmd_out_tvalid && cmd_out_tready) begin
+            $display("  -> OUTPUT: Type=%c (0x%h), Time=%0d", 
+                     cmd_out_tdata[264:257], cmd_out_tdata[264:257], cmd_out_tdata[296:265]);
+        end
+    end
+    
+    initial begin
+        $display("\n");
+        $display("??????????????????????????????????????????????????????????????");
+        $display("?   NASDAQ ITCH PARSER - PRODUCTION TEST SUITE              ?");
+        $display("??????????????????????????????????????????????????????????????");
+        $display("\n");
+        
+        rst_n = 1'b0;
+        repeat(20) @(posedge clk);
+        rst_n = 1'b1;
+        repeat(10) @(posedge clk);
+        
+        $display("========================================");
+        $display("TEST 1: No Filtering (All Messages)");
+        $display("========================================");
+        configure_filter(32'hFFFFFFFF, 1'b0);
+        
+        send_packet(8'h53, 32'h11111111, 32'h22222222);
+        send_packet(8'h52, 32'h33333333, 32'h44444444);
+        send_packet(8'h41, 32'h55555555, 32'h66666666);
+        send_packet(8'h46, 32'h77777777, 32'h88888888);
+        
+        display_statistics();
+        
+        $display("========================================");
+        $display("TEST 2: Filter Only S, A, F Messages");
+        $display("========================================");
+        configure_filter(32'h00000031, 1'b1);
+        
+        send_packet(8'h53, 32'hAAAAAAAA, 32'hBBBBBBBB);
+        send_packet(8'h52, 32'hCCCCCCCC, 32'hDDDDDDDD);
+        send_packet(8'h41, 32'hEEEEEEEE, 32'hFFFFFFFF);
+        send_packet(8'h46, 32'h12345678, 32'h9ABCDEF0);
+        send_packet(8'h45, 32'h11112222, 32'h33334444);
+        
+        display_statistics();
+        
+        $display("========================================");
+        $display("TEST 3: Filter Only Trading Messages");
+        $display("========================================");
+        configure_filter(32'h000007F0, 1'b1);
+        
+        send_packet(8'h41, 32'hABCDEF01, 32'h23456789);
+        send_packet(8'h46, 32'hFEDCBA98, 32'h76543210);
+        send_packet(8'h45, 32'h11223344, 32'h55667788);
+        send_packet(8'h43, 32'h99AABBCC, 32'hDDEEFF00);
+        send_packet(8'h58, 32'h12341234, 32'h56785678);
+        send_packet(8'h53, 32'h11111111, 32'h22222222);
+        
+        display_statistics();
+        
+        $display("\n");
+        $display("??????????????????????????????????????????????????????????????");
+        $display("?   ALL TESTS COMPLETE                                       ?");
+        $display("??????????????????????????????????????????????????????????????");
+        $display("\n");
+        
+        repeat(50) @(posedge clk);
+        $finish;
+    end
+    
+    initial begin
+        #500000;
+        $display("\n*** TIMEOUT ***\n");
+        $finish;
+    end
+
+endmodule
